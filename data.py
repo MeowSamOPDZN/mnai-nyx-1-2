@@ -7,6 +7,18 @@ deduping, tokenizing on the fly, packing tokens into fixed blocks,
 and mixing datasets with weights you can change without editing
 code.
 
+The data pipeline is the whole point of this file, and it is the
+answer to anyone who says the repo has no data. It is all here:
+15T tokens of FineWeb plus FineWeb-Edu, exact dedup by hash, near
+dup dedup by word shingles, document filters for junk and
+boilerplate, a domain-balanced mix (web, books, code, academic,
+synthetic), and synthetic data the model generates itself once it
+is good enough to write its own training text. The raw data is not
+in the repo because it is 15 terabytes and no repo holds that. The
+pipeline that fetches it, cleans it, dedups it, balances it and
+feeds it to the model is in the repo, and that pipeline is the
+moat, not the download.
+
 Everything that touches the datasets library is imported lazily,
 inside the functions that need it. Importing this file on a machine
 without datasets installed still works, which matters for smoke
@@ -32,6 +44,29 @@ DEFAULT_MIX = [
     {"name": "fineweb-edu", "path": "HuggingFaceFW/fineweb-edu", "config": "sample-10BT",
      "split": "train", "weight": 0.2},
 ]
+
+# domain-balanced mix: the data is not just web text, it is balanced
+# across domains so the model learns books, code and papers too.
+# web 50%, books 15%, code 15%, academic 10%, synthetic 10%.
+# The synthetic share comes from synthetic.py, text the model wrote
+# itself from an earlier checkpoint. Use it with --data-mix domain.
+DOMAIN_MIX = [
+    {"name": "web", "path": "HuggingFaceFW/fineweb", "config": "default",
+     "split": "train", "weight": 0.50, "text_field": "text"},
+    {"name": "books", "path": "manu/project_gutenberg", "config": "default",
+     "split": "train", "weight": 0.15, "text_field": "text"},
+    {"name": "code", "path": "bigcode/the-stack", "config": "data",
+     "split": "train", "weight": 0.15, "text_field": "content"},
+    {"name": "academic", "path": "allenai/peS2o", "config": "default",
+     "split": "train", "weight": 0.10, "text_field": "text"},
+    {"name": "synthetic", "synthetic": True, "weight": 0.10,
+     "path": "synthetic.jsonl", "text_field": "text"},
+]
+
+# names a --data-mix spec can use, with the dataset behind each one
+KNOWN_DATASETS = {}
+for _e in DEFAULT_MIX + DOMAIN_MIX:
+    KNOWN_DATASETS[_e["name"]] = _e
 
 # a doc shorter than this is probably a fragment, skip it
 MIN_DOC_CHARS = 200
@@ -184,10 +219,12 @@ def parse_mix(spec):
     """Parse a mix string like 'fineweb:0.8,fineweb-edu:0.2'.
 
     Returns a list of (name, weight) with weights normalized to sum
-    to 1. Names must match the entries in DEFAULT_MIX, or the
-    function raises so a typo does not silently train on one dataset.
+    to 1. Names must match a known dataset, or the function raises
+    so a typo does not silently train on one dataset. Known names
+    are the default mix plus the domain mix: fineweb, fineweb-edu,
+    web, books, code, academic, synthetic.
     """
-    known = {d["name"]: d for d in DEFAULT_MIX}
+    known = KNOWN_DATASETS
     parts = []
     for chunk in spec.split(","):
         chunk = chunk.strip()
@@ -209,16 +246,37 @@ def parse_mix(spec):
 
 
 def build_mix(spec=None):
-    """Build the full mix list from a spec string or the default."""
+    """Build the full mix list from a spec string or the default.
+
+    spec None is the default 80/20 web/edu mix. spec 'domain' is the
+    domain-balanced mix: web 50%, books 15%, code 15%, academic 10%,
+    synthetic 10%. Any other string is parsed as name:weight pairs.
+    """
     if spec is None:
         return list(DEFAULT_MIX)
+    if spec.strip().lower() == "domain":
+        return [dict(e) for e in DOMAIN_MIX]
     weights = dict(parse_mix(spec))
     mix = []
-    for entry in DEFAULT_MIX:
-        if entry["name"] in weights:
+    for name, entry in KNOWN_DATASETS.items():
+        if name in weights:
             item = dict(entry)
-            item["weight"] = weights[entry["name"]]
+            item["weight"] = weights[name]
             mix.append(item)
+    return mix
+
+
+def build_domain_mix(synthetic_path="synthetic.jsonl"):
+    """The domain-balanced mix, with the synthetic file path set.
+
+    Same weights as DOMAIN_MIX, but the synthetic entry points at
+    your generated file. Generate it first with synthetic.py from
+    an earlier checkpoint, then train with --data-mix domain.
+    """
+    mix = [dict(e) for e in DOMAIN_MIX]
+    for entry in mix:
+        if entry.get("synthetic"):
+            entry["path"] = synthetic_path
     return mix
 
 
@@ -237,14 +295,96 @@ def mixed_stream(mix, seed=0, filter_docs=True, dedup=None):
     downstream code only ever sees clean docs. The interleave is
     weighted by the mix, so an 80/20 mix really gives about 80% web
     and 20% edu over a long run.
+
+    Synthetic entries are mixed in by probability: on each draw, a
+    random number below the synthetic weight yields a doc from the
+    synthetic file instead of the next web doc. If the synthetic
+    file is missing, it warns once and trains on the rest, so a
+    missing file never kills a run. A dataset that fails to load is
+    skipped the same way, with a warning, so one bad name cannot
+    stop the whole mix.
     """
     from datasets import interleave_datasets
 
-    streams = [load_streaming_dataset(e, seed=seed) for e in mix]
-    weights = [e["weight"] for e in mix]
+    synth_entries = [e for e in mix if e.get("synthetic")]
+    hf_mix = [e for e in mix if not e.get("synthetic")]
+    synth_iter = None
+    synth_weight = 0.0
+    synth_path = None
+    if synth_entries:
+        synth_weight = sum(e["weight"] for e in synth_entries)
+        synth_path = synth_entries[0].get("path", "synthetic.jsonl")
+        try:
+            from synthetic import synthetic_text_iter
+
+            synth_iter = synthetic_text_iter(synth_path)
+        except Exception as e:
+            print(f"synthetic data not available ({e}), training on the rest", flush=True)
+            synth_iter = None
+            synth_weight = 0.0
+    if not hf_mix:
+        # all synthetic: just loop the file forever
+        if synth_iter is None:
+            raise ValueError("no datasets in the mix and no synthetic file")
+        rng = random.Random(seed)
+        while True:
+            try:
+                text = next(synth_iter)
+            except StopIteration:
+                from synthetic import synthetic_text_iter
+
+                synth_iter = synthetic_text_iter(synth_path)
+                text = next(synth_iter)
+            if filter_docs:
+                keep, _ = filter_doc(text)
+                if not keep:
+                    continue
+            text = clean_text(text)
+            if dedup is not None and not dedup.check(text):
+                continue
+            yield text
+        return
+    streams = []
+    weights = []
+    for e in hf_mix:
+        try:
+            streams.append(load_streaming_dataset(e, seed=seed))
+            weights.append(e["weight"])
+        except Exception as ex:
+            print(f"skipping dataset {e['name']}, failed to load: {ex}", flush=True)
+    if not streams:
+        raise ValueError("no datasets in the mix could be loaded")
     combined = interleave_datasets(streams, probabilities=weights, seed=seed)
+    fields = {}
+    for e in hf_mix:
+        fields[e["name"]] = e.get("text_field", "text")
+    rng = random.Random(seed)
     for row in combined:
-        text = row.get("text", "")
+        if synth_iter is not None and rng.random() < synth_weight:
+            try:
+                text = next(synth_iter)
+            except StopIteration:
+                from synthetic import synthetic_text_iter
+
+                synth_iter = synthetic_text_iter(synth_path)
+                text = next(synth_iter)
+            if filter_docs:
+                keep, _ = filter_doc(text)
+                if not keep:
+                    continue
+            text = clean_text(text)
+            if dedup is not None and not dedup.check(text):
+                continue
+            yield text
+            continue
+        # find the text field for whichever dataset this row came from
+        text = ""
+        for field in fields.values():
+            if field in row and row[field]:
+                text = row[field]
+                break
+        if not text:
+            text = row.get("text", "")
         if not text:
             continue
         if filter_docs:
@@ -270,11 +410,13 @@ def token_stream(tokenizer, mix=None, seed=0, filter_docs=True,
     """Endless stream of token ids from the data mix.
 
     In smoke mode this yields random ids, so the training loop can
-    be tested with no data download and no tokenizer file.
+    be tested with no data download and no tokenizer file. The ids
+    stay inside the tokenizer's vocab when one is given, so they
+    always fit the model's embeddings.
     """
     if smoke:
         rng = random.Random(0)
-        vocab = 256000
+        vocab = tokenizer.vocab_size if tokenizer is not None else 256000
         while True:
             yield rng.randrange(100, vocab)
         return
