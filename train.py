@@ -102,6 +102,7 @@ from model import (
     estimate_flops_per_token,
     moe_aux_loss,
     moe_counts,
+    moe_z_loss,
 )
 from utils import (
     MetricLogger,
@@ -142,6 +143,17 @@ def parse_args():
                    help="0 = dense (default), 8 = MoE with 8 experts per layer, top-k routed")
     p.add_argument("--moe-topk", type=int, default=2,
                    help="how many experts each token is routed to when MoE is on")
+    p.add_argument("--moe-capacity-factor", type=float, default=1.25,
+                   help="per-expert token cap as a multiple of the even share, "
+                        "1.25 leaves headroom without letting one expert drown")
+    p.add_argument("--parallel-strategy", default="fsdp",
+                   choices=["fsdp", "3d"],
+                   help="fsdp shards everything across all GPUs, fine up to "
+                        "~128 GPUs. 3d splits tensor + pipeline + data "
+                        "parallel, use it above ~256 GPUs (see parallel.py)")
+    p.add_argument("--parallel-plan", type=int, default=0,
+                   help="print the recommended parallel plan for this many "
+                        "GPUs and exit, no training")
     p.add_argument("--loss-spike-threshold", type=float, default=3.0,
                    help="if a step loss is above this many times the running average, "
                         "drop the step and reload the last checkpoint, 0 disables")
@@ -631,6 +643,22 @@ def main():
     log = setup_logging(log_file=args.log_file)
     seed_all(args.seed)
 
+    # --parallel-plan prints the recommended parallel plan and exits,
+    # no training, no cluster needed. Params counted on the meta
+    # device: build_model on its own allocates real weights, so the
+    # meta context is what keeps a 500B count from eating all RAM.
+    if args.parallel_plan:
+        from parallel import print_parallel_plan
+
+        with torch.device("meta"):
+            plan_model = build_model(dtype=None, moe_experts=args.moe_experts,
+                                     moe_topk=args.moe_topk)
+        total, _ = count_params(plan_model)
+        print_parallel_plan(args.parallel_plan, total,
+                            plan_model.config.num_hidden_layers,
+                            args.moe_experts)
+        return 0
+
     # distributed setup, torchrun sets these env vars
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
     rank = int(os.environ.get("RANK", "0"))
@@ -707,7 +735,8 @@ def main():
         else:
             model = build_model(dtype=train_dtype,
                                 moe_experts=args.moe_experts,
-                                moe_topk=args.moe_topk)
+                                moe_topk=args.moe_topk,
+                                moe_capacity_factor=args.moe_capacity_factor)
         step = 0
         tokens_seen = 0
 
@@ -723,13 +752,39 @@ def main():
 
     # FSDP2: shard the 2.1T model across all GPUs
     if use_dist:
-        from torch.distributed.fsdp import fully_shard
+        if args.parallel_strategy == "3d":
+            # 3D parallel: tensor parallel inside a node, pipeline
+            # parallel across layers, FSDP only inside the data
+            # parallel group. Pure FSDP over 256+ GPUs all-reduces
+            # the full gradient set across nodes every step; this
+            # keeps the heavy traffic inside a node instead.
+            from parallel import (apply_3d_parallel, build_mesh,
+                                  plan_parallel)
 
-        for layer in model.model.layers:
-            fully_shard(layer)
-        fully_shard(model)
-        if is_main():
-            log.info(f"FSDP2 enabled, sharded across {world_size} GPUs")
+            n_layers = model.config.num_hidden_layers
+            plan = plan_parallel(world_size, total, n_layers,
+                                 args.moe_experts)
+            mesh = build_mesh(world_size, tp=plan["tp"], pp=plan["pp"],
+                              dp=plan["dp"], device_type="cuda")
+            model = apply_3d_parallel(model, mesh, n_layers)
+            from torch.distributed.fsdp import fully_shard
+
+            dp_mesh = mesh["dp"]
+            for layer in model.model.layers:
+                fully_shard(layer, mesh=dp_mesh)
+            fully_shard(model, mesh=dp_mesh)
+            if is_main():
+                log.info(f"3D parallel enabled: TP {plan['tp']}, "
+                         f"PP {plan['pp']}, DP {plan['dp']}, "
+                         "FSDP inside the DP group")
+        else:
+            from torch.distributed.fsdp import fully_shard
+
+            for layer in model.model.layers:
+                fully_shard(layer)
+            fully_shard(model)
+            if is_main():
+                log.info(f"FSDP2 enabled, sharded across {world_size} GPUs")
 
     if not args.no_grad_checkpoint:
         model.gradient_checkpointing_enable()
@@ -816,11 +871,16 @@ def main():
                             dtype=autocast_dtype, enabled=use_bf16):
             out = model(x, labels=x)
             loss = out.loss / args.grad_accum
-            # MoE load-balancing aux loss, small weight, only when MoE is on
+            # MoE losses, small weights, only when MoE is on. The aux
+            # loss spreads tokens across experts, the z-loss keeps
+            # router logits small so routing cannot collapse onto one
+            # expert. Both are guarded by the capacity factor in the
+            # MoE layer, which caps tokens per expert per batch.
             aux_loss = 0.0
             if args.moe_experts > 0:
                 aux_loss = moe_aux_loss(model)
                 loss = loss + 0.01 * aux_loss / args.grad_accum
+                loss = loss + 0.001 * moe_z_loss(model) / args.grad_accum
         timer.stop("forward")
         timer.start("backward")
         loss.backward()
