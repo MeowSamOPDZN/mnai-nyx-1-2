@@ -2,7 +2,9 @@
 
 **AIMYTOG: AI Model You'll Train On GPU.**
 
-A 2.1T parameter frontier language model, from scratch. You bring the GPU. The repo is the model, the training code, and the tokenizer. Nothing is pre-trained here. You train it yourself, on your own cluster, with your own data. That is the whole point.
+**ANY-to-ANY: text, image, and audio in, text, image, and audio out. One model reads and writes all three.**
+
+A 2.1T parameter frontier any-to-any model, from scratch. You bring the GPU. The repo is the model, the training code, and the tokenizer. Nothing is pre-trained here. You train it yourself, on your own cluster, with your own data. That is the whole point.
 
 > MNAI Nyx family is a real legit AI, That YOU have to train.
 
@@ -14,8 +16,9 @@ MNAI Nyx 1.2. From scratch, no base model, no distillation.
 
 | | |
 |---|---|
-| Params | **2,183,775,031,296 (2.184T)** |
-| Architecture | Llama decoder, GQA, SwiGLU, RoPE, RMSNorm |
+| Params | **2,210,128,644,368 (2.210T)** — core text 2.184T + vision 6.29B + image decoder 18.86B + audio 1.20B |
+| Architecture | Llama decoder, GQA, SwiGLU, RoPE, RMSNorm + ViT vision encoder + DiT image decoder + audio encoder/decoder |
+| Modalities | text, image, audio in and out |
 | Hidden | 36864 |
 | Layers | 144 |
 | Heads | 288 query, 16 key/value |
@@ -110,11 +113,49 @@ python train.py --smoke --max-steps 3 --out /tmp/smoke-nyx12
 python model.py
 ```
 
+## Make your OWN named LLM
+
+This repo is a template. Rename the model to yours in 2 minutes, 4 small changes. Example: rename it to **MyCoolModel**.
+
+**Step 1 — model.py, line 95.** Open `model.py`, find this line:
+```python
+MODEL_NAME = "MNAI Nyx 1.2"
+```
+Change it to:
+```python
+MODEL_NAME = "MyCoolModel"
+```
+That is the only code change. The name shows up in the model description and logs from here on.
+
+**Step 2 — README.md, line 1.** Open `README.md`, find this line:
+```markdown
+# MNAI Nyx 1.2
+```
+Change it to:
+```markdown
+# MyCoolModel
+```
+
+**Step 3 — train.py, line 129.** Open `train.py`, find this line:
+```python
+p.add_argument("--out", default="out-nyx12")
+```
+Change it to:
+```python
+p.add_argument("--out", default="out-mycoolmodel")
+```
+That is just the default output folder name for your checkpoints. You can also leave it and pass `--out` yourself every run.
+
+**Step 4 — config.json.** Nothing to change. There is no name field in `config.json`, the shape is the same whatever you call the model.
+
+That is it. Train it, and the model that comes out is MyCoolModel, trained by you, on your data, on your GPU.
+
 ## Files
 
 | File | What it is |
 |---|---|
 | `model.py` | The 2.1T architecture (MNAI Nyx 1.2), param count, FLOPs, init, surgery helpers |
+| `multimodal.py` | Any-to-any modules: ViT vision encoder, DiT image decoder, audio encoder/decoder |
 | `train.py` | FSDP2 distributed training, schedulers, optimizers, WandB, eval, full checkpoints |
 | `data.py` | Data loading, filtering, dedup, tokenization, dataset mixing |
 | `evaluate.py` | Perplexity, HellaSwag / ARC / Winogrande benchmarks, generation quality |
@@ -150,7 +191,10 @@ The entire web. The full FineWeb crawl, 15 trillion tokens of open web text, plu
 Yes. The code is MIT licensed and public on GitHub. The model is yours once you train it.
 
 **How big is MNAI Nyx 1.2?**
-2.184 trillion parameters. 36864 hidden, 144 layers, 288 attention heads, 256000 token vocabulary, 16384 context.
+2.210 trillion parameters. Core text is 2.184T (36864 hidden, 144 layers, 288 attention heads, 256000 token vocabulary, 16384 context), plus the any-to-any modules: vision encoder 6.29B, image decoder 18.86B, audio encoder and decoder 1.20B.
+
+**Is MNAI Nyx 1.2 any-to-any?**
+Yes. Text, image, and audio in, text, image, and audio out. One model reads and writes all three. The vision encoder, DiT image decoder, and audio encoder/decoder live in multimodal.py.
 
 ## Credits
 
