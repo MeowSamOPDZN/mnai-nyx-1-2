@@ -1,0 +1,33 @@
+MNAI Weights License, version 1.0
+
+This license covers trained weights and GGUF files produced by
+training an MNAI Nyx model (Nyx 0.5, Nyx 1, Nyx 1.2). It does NOT
+cover the code in this repo. The code is under the MIT License,
+see LICENSE. The code and the weights have different licenses on
+purpose: the code is free, the weights carry the rules below.
+That split is what makes the two consistent — MIT on the code
+never promised anything about the weights.
+
+1. Use. You may run the weights, build products on them, and
+   charge for what you build. No fee, no royalty, no permission
+   needed.
+2. Distribute unchanged. You may share the weights as they are,
+   unchanged, under the same name they were trained under.
+3. Locked. You may not modify the weights and re-release them,
+   and you may not re-release them under a different name. The
+   weights are locked to the model they came from: what was
+   trained is what ships. Taking finished weights, changing them,
+   and passing them off as a different model is not allowed.
+4. Training is not re-releasing. Pre-training, SFT, and DPO are
+   how the weights are made in the first place. Continuing to
+   train your own model is training, not a re-release, and this
+   license does not stop it. The lock bites when finished weights
+   are handed on as something else.
+5. Rename. You may rename the model to your own brand — once you
+   train it, it is your LLM. The rename is branding, not a new
+   model: the weights stay the ones you trained.
+6. Attribution. Wherever you name the model, put the text
+   "Your Brand x MNAI" on it, with your brand name in place of
+   "Your Brand". That credit is the only thing you owe.
+7. No warranty. The weights are provided as-is, with no warranty
+   of any kind, express or implied.
