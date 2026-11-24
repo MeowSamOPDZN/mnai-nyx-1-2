@@ -147,7 +147,7 @@ def build_config(attn_implementation="sdpa"):
 
 
 def build_model(dtype=torch.bfloat16, attn_implementation="sdpa",
-                moe_experts=0, moe_topk=2):
+                moe_experts=0, moe_topk=2, moe_capacity_factor=1.25):
     """Build a fresh Nyx 1.2 with random weights.
 
     dtype None leaves the model on the meta device, which is how you
@@ -168,7 +168,8 @@ def build_model(dtype=torch.bfloat16, attn_implementation="sdpa",
         with torch.device(device):
             for layer in model.model.layers:
                 layer.mlp = MoELayer(HIDDEN_SIZE, INTERMEDIATE_SIZE,
-                                     n_experts=moe_experts, top_k=moe_topk)
+                                     n_experts=moe_experts, top_k=moe_topk,
+                                     capacity_factor=moe_capacity_factor)
     if dtype is not None:
         model = model.to(dtype)
     return model
@@ -201,37 +202,65 @@ class MoELayer(nn.Module):
     Transformer load-balancing loss: it pushes the router to spread
     tokens evenly so no expert starves and none gets overloaded.
     Add it to the training loss with a small weight, 0.01 is typical.
+    The router z-loss (ST-MoE) penalises large router logits, which
+    is what makes routing blow up into one expert; the trainer adds
+    it with weight 0.001. Each expert also has a token capacity, a
+    multiple of its even share, so a collapsed router cannot drown
+    one expert in a whole batch.
 
     Input and output shapes are identical to the dense MLP, so this
     swaps straight into any Llama block. Total params grow with the
     expert count, but active params per token only grow with top k.
     """
 
-    def __init__(self, hidden, intermediate, n_experts=8, top_k=2):
+    def __init__(self, hidden, intermediate, n_experts=8, top_k=2,
+                 capacity_factor=1.25):
         super().__init__()
         self.hidden = hidden
         self.intermediate = intermediate
         self.n_experts = n_experts
         self.top_k = top_k
+        # capacity: no expert takes more than this multiple of its even
+        # share of tokens. 1.0 is exactly even, 1.25 leaves headroom
+        # for a lopsided batch without letting one expert drown.
+        self.capacity_factor = capacity_factor
         self.router = nn.Linear(hidden, n_experts, bias=False)
         self.experts = nn.ModuleList(
             [SwiGLUMLP(hidden, intermediate) for _ in range(n_experts)])
-        # set on every forward, read by moe_aux_loss in the trainer
+        # set on every forward, read by moe_aux_loss / moe_z_loss
         self.aux_loss = 0.0
+        self.z_loss = 0.0
 
     def forward(self, x):
-        logits = self.router(x)
+        shape = x.shape
+        flat = x.reshape(-1, shape[-1])
+        logits = self.router(flat)
         probs = torch.softmax(logits, dim=-1)
         topk_vals, topk_idx = torch.topk(probs, k=self.top_k, dim=-1)
         topk_vals = topk_vals / topk_vals.sum(dim=-1, keepdim=True)
-        out = torch.zeros_like(x)
+        # router z-loss, from ST-MoE: penalises large router logits,
+        # which is what makes routing blow up into one expert. A
+        # 0.001 weight on this in the trainer is the usual size.
+        self.z_loss = torch.logsumexp(logits, dim=-1).pow(2).mean()
+        out = torch.zeros_like(flat)
+        n_tokens = flat.shape[0]
+        # per-expert token cap. Tokens past the cap for an expert are
+        # dropped for that expert: they still ride the block's residual
+        # stream, they just get no expert output. Without a cap a
+        # collapsed router can send a whole batch to one expert and
+        # blow its memory and its gradients.
+        capacity = max(1, math.ceil(n_tokens * self.top_k / self.n_experts
+                                    * self.capacity_factor))
         for k in range(self.top_k):
-            idx = topk_idx[..., k]
-            w = topk_vals[..., k].unsqueeze(-1)
+            idx = topk_idx[:, k]
+            w = topk_vals[:, k].unsqueeze(-1)
             for e in range(self.n_experts):
-                mask = idx == e
-                if mask.any():
-                    out[mask] = out[mask] + w[mask] * self.experts[e](x[mask])
+                pos = (idx == e).nonzero(as_tuple=True)[0]
+                if pos.numel() == 0:
+                    continue
+                if pos.numel() > capacity:
+                    pos = pos[:capacity]
+                out[pos] = out[pos] + w[pos] * self.experts[e](flat[pos])
         # load balancing: f is the share of tokens each expert got,
         # P is the mean router probability for each expert. If one
         # expert takes everything, f * P is large, so the loss pushes
@@ -243,7 +272,7 @@ class MoELayer(nn.Module):
             f = counts / max(1, flat_idx.numel())
         p_mean = probs.mean(dim=tuple(range(probs.dim() - 1)))
         self.aux_loss = self.n_experts * (f * p_mean).sum()
-        return out
+        return out.reshape(shape)
 
 
 def moe_counts(model, moe_experts, moe_topk):
@@ -278,6 +307,47 @@ def moe_aux_loss(model):
         if isinstance(mlp, MoELayer):
             total = total + mlp.aux_loss
     return total
+
+
+def moe_z_loss(model):
+    """Sum of the router z-losses from all MoE layers.
+
+    Same shape as moe_aux_loss: each layer sets z_loss on forward,
+    the trainer adds it with a small weight (0.001 is typical). It
+    keeps router logits small, which is the guard against routing
+    collapse that the load-balancing loss alone does not give.
+    Returns 0.0 for a dense model.
+    """
+    total = 0.0
+    for layer in model.model.layers:
+        mlp = layer.mlp
+        if isinstance(mlp, MoELayer):
+            total = total + mlp.z_loss
+    return total
+
+
+def moe_router_balance(model):
+    """Per-expert token share from the last forward, all MoE layers.
+
+    Returns a list of per-layer dicts with the token count each
+    expert got and the worst imbalance (max share / even share).
+    Used by validate_cluster.py to check the router is actually
+    spreading tokens instead of collapsing onto one expert.
+    """
+    out = []
+    for layer in model.model.layers:
+        mlp = layer.mlp
+        if not isinstance(mlp, MoELayer):
+            continue
+        aux = mlp.aux_loss
+        if isinstance(aux, torch.Tensor):
+            aux = aux.item()
+        out.append({"n_experts": mlp.n_experts, "top_k": mlp.top_k,
+                    "capacity_factor": mlp.capacity_factor,
+                    "aux_loss": aux,
+                    "z_loss": mlp.z_loss.item()
+                    if isinstance(mlp.z_loss, torch.Tensor) else mlp.z_loss})
+    return out
 
 
 def describe_moe(model, moe_experts, moe_topk):
