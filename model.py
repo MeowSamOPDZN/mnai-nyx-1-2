@@ -88,6 +88,8 @@ import math
 import os
 
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
 from transformers import LlamaConfig, LlamaForCausalLM
 
 # the model name. Change this to rename the model, see the README
@@ -144,19 +146,151 @@ def build_config(attn_implementation="sdpa"):
     )
 
 
-def build_model(dtype=torch.bfloat16, attn_implementation="sdpa"):
+def build_model(dtype=torch.bfloat16, attn_implementation="sdpa",
+                moe_experts=0, moe_topk=2):
     """Build a fresh Nyx 1.2 with random weights.
 
     dtype None leaves the model on the meta device, which is how you
     count parameters without allocating a terabyte of RAM. Pass
     torch.bfloat16 for a real model, torch.float32 if you want the
     extra precision on a small test.
+
+    moe_experts 0 means the dense model, the default. Pass 8 (with
+    moe_topk 2) for the MoE variant: every block's SwiGLU MLP is
+    swapped for a MoE layer with that many experts, and each token
+    is routed to the top 2. Same input and output shapes, so the
+    rest of the model does not change. See MoELayer below.
     """
     cfg = build_config(attn_implementation=attn_implementation)
     model = LlamaForCausalLM(cfg)
+    if moe_experts > 0:
+        device = next(model.parameters()).device
+        with torch.device(device):
+            for layer in model.model.layers:
+                layer.mlp = MoELayer(HIDDEN_SIZE, INTERMEDIATE_SIZE,
+                                     n_experts=moe_experts, top_k=moe_topk)
     if dtype is not None:
         model = model.to(dtype)
     return model
+
+
+class SwiGLUMLP(nn.Module):
+    """One SwiGLU feed-forward, the same shape as the dense block's.
+
+    Three matrices: gate, up, down. Used as a single expert inside
+    a MoE layer, so each expert is exactly the dense MLP it replaces.
+    """
+
+    def __init__(self, hidden, intermediate):
+        super().__init__()
+        self.gate_proj = nn.Linear(hidden, intermediate, bias=False)
+        self.up_proj = nn.Linear(hidden, intermediate, bias=False)
+        self.down_proj = nn.Linear(intermediate, hidden, bias=False)
+
+    def forward(self, x):
+        return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
+
+
+class MoELayer(nn.Module):
+    """Mixture-of-Experts feed-forward, a drop-in for the dense MLP.
+
+    A router picks the top k experts for each token, each expert is
+    a SwiGLU MLP the same size as the dense one it replaces, and the
+    outputs are mixed by the router weights. Tokens that pick the
+    same expert are processed together. The aux loss is the Switch
+    Transformer load-balancing loss: it pushes the router to spread
+    tokens evenly so no expert starves and none gets overloaded.
+    Add it to the training loss with a small weight, 0.01 is typical.
+
+    Input and output shapes are identical to the dense MLP, so this
+    swaps straight into any Llama block. Total params grow with the
+    expert count, but active params per token only grow with top k.
+    """
+
+    def __init__(self, hidden, intermediate, n_experts=8, top_k=2):
+        super().__init__()
+        self.hidden = hidden
+        self.intermediate = intermediate
+        self.n_experts = n_experts
+        self.top_k = top_k
+        self.router = nn.Linear(hidden, n_experts, bias=False)
+        self.experts = nn.ModuleList(
+            [SwiGLUMLP(hidden, intermediate) for _ in range(n_experts)])
+        # set on every forward, read by moe_aux_loss in the trainer
+        self.aux_loss = 0.0
+
+    def forward(self, x):
+        logits = self.router(x)
+        probs = torch.softmax(logits, dim=-1)
+        topk_vals, topk_idx = torch.topk(probs, k=self.top_k, dim=-1)
+        topk_vals = topk_vals / topk_vals.sum(dim=-1, keepdim=True)
+        out = torch.zeros_like(x)
+        for k in range(self.top_k):
+            idx = topk_idx[..., k]
+            w = topk_vals[..., k].unsqueeze(-1)
+            for e in range(self.n_experts):
+                mask = idx == e
+                if mask.any():
+                    out[mask] = out[mask] + w[mask] * self.experts[e](x[mask])
+        # load balancing: f is the share of tokens each expert got,
+        # P is the mean router probability for each expert. If one
+        # expert takes everything, f * P is large, so the loss pushes
+        # the router to spread out. Kept as a tensor so the router
+        # gets gradients from it, f itself is just counts.
+        with torch.no_grad():
+            flat_idx = topk_idx.reshape(-1)
+            counts = torch.bincount(flat_idx, minlength=self.n_experts).float()
+            f = counts / max(1, flat_idx.numel())
+        p_mean = probs.mean(dim=tuple(range(probs.dim() - 1)))
+        self.aux_loss = self.n_experts * (f * p_mean).sum()
+        return out
+
+
+def moe_counts(model, moe_experts, moe_topk):
+    """Total, active-per-token, and MoE-only params for a MoE model.
+
+    Active params are the ones a single token actually touches:
+    everything except the experts, plus the top k share of the
+    experts. That is the number that decides how fast and how cheap
+    the model runs, while the total is the capacity it holds.
+    """
+    total, _ = count_params(model)
+    moe_params = 0
+    for layer in model.model.layers:
+        mlp = layer.mlp
+        if isinstance(mlp, MoELayer):
+            moe_params += sum(p.numel() for p in mlp.parameters())
+    non_moe = total - moe_params
+    active = non_moe + moe_params * moe_topk // moe_experts
+    return total, active, moe_params
+
+
+def moe_aux_loss(model):
+    """Sum of the load-balancing aux losses from all MoE layers.
+
+    Each layer sets its aux_loss on forward, as a tensor so the
+    router gets gradients. Returns 0.0 for a dense model, which has
+    no MoE layers at all.
+    """
+    total = 0.0
+    for layer in model.model.layers:
+        mlp = layer.mlp
+        if isinstance(mlp, MoELayer):
+            total = total + mlp.aux_loss
+    return total
+
+
+def describe_moe(model, moe_experts, moe_topk):
+    """Describe the MoE variant: total vs active params per token."""
+    total, active, moe_params = moe_counts(model, moe_experts, moe_topk)
+    lines = [
+        f"{MODEL_NAME} (MoE, {moe_experts} experts, top-{moe_topk})",
+        f"total params {total:,} ({total / 1e12:.3f}T)",
+        f"active params per token {active:,} ({active / 1e12:.3f}T)",
+        f"MoE params {moe_params:,} ({100.0 * moe_params / total:.1f}% of total)",
+        f"a token touches {100.0 * active / total:.1f}% of the model",
+    ]
+    return "\n".join(lines)
 
 
 def build_any_to_any_model(dtype=None, attn_implementation="sdpa"):
@@ -521,6 +655,15 @@ def save_config_only(out_dir):
 
 
 if __name__ == "__main__":
+    import argparse
+
+    p = argparse.ArgumentParser()
+    p.add_argument("--moe-experts", type=int, default=0,
+                   help="0 = dense (default), 8 = MoE with 8 experts per layer")
+    p.add_argument("--moe-topk", type=int, default=2,
+                   help="how many experts each token is routed to")
+    args = p.parse_args()
+
     here = os.path.dirname(os.path.abspath(__file__))
     # meta device: count params without allocating 1TB of RAM
     with torch.device("meta"):
@@ -543,6 +686,16 @@ if __name__ == "__main__":
     print(describe_any_to_any(full))
     print()
     print("any-to-any total is core plus all four modality modules.")
+    if args.moe_experts > 0:
+        # MoE variant: same core, every MLP swapped for a MoE layer
+        print()
+        with torch.device("meta"):
+            moe_model = build_model(dtype=None, moe_experts=args.moe_experts,
+                                    moe_topk=args.moe_topk)
+        print(describe_moe(moe_model, args.moe_experts, args.moe_topk))
+        print()
+        print("MoE total is capacity, active per token is what a token")
+        print("actually runs through. Dense stays the default.")
     # save the config next to the code so tools agree on the shape
     cfg = build_config()
     cfg.save_pretrained(os.path.join(here, "hf_config_only"))
