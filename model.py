@@ -71,6 +71,17 @@ tools: validate the config before a run starts, print a parameter
 breakdown so you can see where the 2.1T goes, estimate training
 FLOPs, pick a weight init, turn flash attention on or off, and do
 small model surgery like dropping layers or merging two checkpoints.
+
+Any-to-any
+----------
+The text core above is only one third of the model. multimodal.py
+adds the rest: a ViT vision encoder that turns pictures into tokens
+the core can read, a DiT image decoder that turns core states back
+into pictures, and an audio encoder and decoder that do the same for
+sound. Text, image and audio all flow through the same core, so one
+model reads and writes all three. build_any_to_any_model wires it
+all together. The core dims never change, the modality modules just
+scale with them.
 """
 import json
 import math
@@ -78,6 +89,10 @@ import os
 
 import torch
 from transformers import LlamaConfig, LlamaForCausalLM
+
+# the model name. Change this to rename the model, see the README
+# section "Make your OWN named LLM" for the full rename steps.
+MODEL_NAME = "MNAI Nyx 1.2"
 
 # the shape, all in one place so train.py and generate.py agree
 VOCAB_SIZE = 256000
@@ -144,6 +159,21 @@ def build_model(dtype=torch.bfloat16, attn_implementation="sdpa"):
     return model
 
 
+def build_any_to_any_model(dtype=None, attn_implementation="sdpa"):
+    """Build the full any-to-any model: Llama core plus modalities.
+
+    The core is the same build_model above. The vision encoder, image
+    decoder, audio encoder and audio decoder come from multimodal.py
+    and are wired in by AnyToAnyModel. dtype None leaves everything
+    on the meta device, which is how you count parameters without
+    allocating terabytes of RAM. Pass torch.bfloat16 for a real model.
+    """
+    from multimodal import AnyToAnyModel
+
+    core = build_model(dtype=dtype, attn_implementation=attn_implementation)
+    return AnyToAnyModel(core)
+
+
 def count_params(model):
     total = sum(p.numel() for p in model.parameters())
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -153,10 +183,35 @@ def count_params(model):
 def describe(model):
     total, _ = count_params(model)
     lines = [
+        f"{MODEL_NAME}",
         f"vocab {VOCAB_SIZE}, hidden {HIDDEN_SIZE}, layers {NUM_LAYERS}",
         f"heads {NUM_HEADS}, kv heads {NUM_KV_HEADS}, ffn {INTERMEDIATE_SIZE}",
         f"context {MAX_CTX}, rope theta {int(ROPE_THETA)}",
         f"params {total:,} ({total / 1e9:.1f}B), tied embeddings: yes",
+    ]
+    return "\n".join(lines)
+
+
+def describe_any_to_any(model):
+    """Describe the full any-to-any model, core plus all four modules.
+
+    model is an AnyToAnyModel from build_any_to_any_model. Prints the
+    core count, each modality module count, and the new total.
+    """
+    from multimodal import modality_param_counts
+
+    total, _ = count_params(model)
+    parts = modality_param_counts()
+    core_total = total - parts["modalities_total"]
+    lines = [
+        f"{MODEL_NAME} (any-to-any)",
+        f"core text: {core_total:,} ({core_total / 1e12:.3f}T)",
+        f"vision encoder: {parts['vision_encoder']:,}",
+        f"image decoder: {parts['image_decoder']:,}",
+        f"audio encoder: {parts['audio_encoder']:,}",
+        f"audio decoder: {parts['audio_decoder']:,}",
+        f"total params {total:,} ({total / 1e12:.3f}T)",
+        "modalities: text, image, audio in and out",
     ]
     return "\n".join(lines)
 
@@ -205,7 +260,7 @@ def estimate_flops_per_token(model=None, seq_len=None):
     grows with context length, so this also adds it in when you pass
     a seq_len. Good enough for planning GPU hours, not a benchmark.
     """
-    n = 496_369_029_120
+    n = 2_183_775_031_296
     flops = 6 * n
     if seq_len:
         # attention FLOPs per token, roughly 12 * layers * heads * head_dim * seq
@@ -481,6 +536,13 @@ if __name__ == "__main__":
     print("this model is 2.1T params. Do not build it on one GPU.")
     print("train.py uses FSDP to shard it across a cluster.")
     print("config problems:", validate_config() or "none")
+    print()
+    # any-to-any: core plus vision, image decoder, audio in and out
+    with torch.device("meta"):
+        full = build_any_to_any_model(dtype=None)
+    print(describe_any_to_any(full))
+    print()
+    print("any-to-any total is core plus all four modality modules.")
     # save the config next to the code so tools agree on the shape
     cfg = build_config()
     cfg.save_pretrained(os.path.join(here, "hf_config_only"))
