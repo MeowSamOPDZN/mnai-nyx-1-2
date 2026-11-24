@@ -4,6 +4,8 @@
 
 A 2.1T parameter frontier language model, from scratch. You bring the GPU. The repo is the model, the training code, and the tokenizer. Nothing is pre-trained here. You train it yourself, on your own cluster, with your own data. That is the whole point.
 
+> MNAI Nyx family is a real legit AI, That YOU have to train.
+
 The data is the ENTIRE web. The full FineWeb crawl, 15 trillion tokens of open web text, plus FineWeb-Edu. FineWeb comes from Common Crawl, which visits every website it can reach, every domain, even the random ones. If a page is on the internet, it is in the crawl. That is the largest open web corpus there is.
 
 ## The model
@@ -128,6 +130,9 @@ python model.py
 MIT. Train it, use it, sell it. It is yours once you train it.
 
 ## FAQ
+
+**Is MNAI Nyx a real AI?**
+MNAI Nyx family is a real legit AI, That YOU have to train.
 
 **What is MNAI Nyx 1.2?**
 MNAI Nyx 1.2 is a 2.1T parameter frontier large language model, built from scratch by MeowSamOPDZN Studio. It is the second model in the Nyx family, after Nyx 1 (500B).
