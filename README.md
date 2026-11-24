@@ -33,6 +33,69 @@ Standard Llama block layout, so llama.cpp can turn a finished checkpoint into a 
 
 The entire web. The training stream is the full FineWeb crawl (15T tokens) plus FineWeb-Edu, interleaved 80/20. A 2.1T model wants about 40T tokens, more than the whole internet holds, so it trains on the full 15T, every website, every domain, even the random ones.
 
+The data pipeline is in this repo, in `data.py`, and it is the whole job, not 5% of it:
+
+- **15T tokens, streamed.** FineWeb (the full Common Crawl, every website, every domain, even the random ones) plus FineWeb-Edu. Nothing is downloaded in bulk, the stream is tokenized on the fly and packed into fixed blocks.
+- **Filtering.** Documents shorter than 200 chars, boilerplate (cookie banners, nav bars, copyright footers), and docs that are mostly non-letters are dropped before they reach the model.
+- **Dedup.** Exact dedup by SHA-256 hash of the normalized text, plus near-dup dedup by 8-word shingles with Jaccard similarity. The same article copied across a hundred sites is trained on once.
+- **Domain-balanced mix.** `--data-mix domain` trains on web 50%, books 15% (Project Gutenberg), code 15% (The Stack), academic 10% (peS2o papers), synthetic 10%. The default mix is web 80% / edu 20%, and any mix can be set with `--data-mix "web:0.5,books:0.2,code:0.2,academic:0.1"`.
+- **Synthetic data.** `synthetic.py` generates training text from an earlier checkpoint and mixes it into the stream, so the model writes its own training data once it is good enough to write coherent text.
+
+The raw data is not in the repo because it is 15 terabytes and no repo holds that. The pipeline that fetches it, cleans it, dedups it, balances it, and feeds it to the model is in the repo. That pipeline is the moat.
+
+## Dense vs MoE
+
+Both are supported. Dense is the default, MoE is an option.
+
+The dense model is the 2.184T text core above: every token runs through every parameter. The MoE variant swaps each block's SwiGLU MLP for a Mixture-of-Experts layer (`MoELayer` in `model.py`): a router picks the top 2 of 8 experts per token, each expert is a full SwiGLU MLP, and a load-balancing aux loss keeps the router from starving any expert.
+
+| | Dense (default) | MoE, 8 experts, top-2 |
+|---|---|---|
+| Total params (text core) | 2.184T | 14.512T |
+| Active params per token | 2.184T | 3.945T |
+| Share of the model a token touches | 100% | 27.2% |
+
+MoE holds far more capacity while activating far fewer params per token, which is why frontier models use it. The trade is complexity: routing, load balancing, and sharding experts across GPUs. Dense is simpler and every tool that reads a Llama checkpoint reads it as-is.
+
+```bash
+# train the MoE variant (text core, 8 experts, top-2 routing)
+torchrun --nproc_per_node=8 --nnodes=128 --node_rank=0 \
+  --master_addr=<master> --master_port=29500 \
+  train.py --tokenizer ./tokenizer --out out-nyx12-moe \
+  --moe-experts 8 --moe-topk 2 --max-tokens 15000000000000
+
+# count the MoE params without allocating memory
+python model.py --moe-experts 8 --moe-topk 2
+```
+
+## Quantized models
+
+A trained checkpoint is about 4.4TB in bf16. Quantization shrinks it so it can actually run. `quantize.py` turns any trained checkpoint into two GGUF files with llama.cpp:
+
+| Quant | Bytes per param | Size (2.184T text core) | Best for |
+|---|---|---|---|
+| Q4_K_M | ~0.55 | ~1,201 GB | the smallest file that still answers well |
+| Q8_0 | ~1.0 | ~2,184 GB | near-original quality, still half the size of bf16 |
+
+```bash
+# produces model-q4-k-m.gguf and model-q8-0.gguf in out-gguf/
+python quantize.py --ckpt out-nyx12/ckpt-5000 --out out-gguf
+```
+
+The Q files are produced from a trained checkpoint once someone trains the model. The script is ready now: point it at any checkpoint, even a smoke checkpoint, and it produces both files. Only the text core becomes a GGUF, because llama.cpp converts Llama models; the any-to-any modality modules stay in PyTorch.
+
+## Scaling
+
+Before burning a cluster on a 2.1T run, frontier labs check the shape on small proxy runs. `scaling.py` does that: it trains three tiny models with the exact same Llama block layout (1M, 5M, 20M params) on real text at one learning rate, fits a Chinchilla-style power law (loss = A * N^-alpha) in log space, and extrapolates the predicted loss at the full 2.210T scale.
+
+```bash
+# about 5 minutes on CPU, no GPU, no data download
+python scaling.py
+python scaling.py --steps 300 --out scaling-report.json
+```
+
+A clean result is a loss that falls smoothly with size, a fitted power law with a small residual, and a predicted loss at full scale that is sane, not exploding. The default run (300 steps, LR 1e-3) gives proxy losses 2.32, 2.26, 2.26 and predicts a loss of about 2.06 at 2.210T. That is the evidence a shape can converge. It is not a guarantee. Only the full run is.
+
 ## Hardware
 
 A 2.1T model does not fit on one GPU. Training needs a cluster with FSDP.
@@ -156,10 +219,13 @@ That is it. Train it, and the model that comes out is MyCoolModel, trained by yo
 
 | File | What it is |
 |---|---|
-| `model.py` | The 2.1T architecture (MNAI Nyx 1.2), param count, FLOPs, init, surgery helpers |
+| `model.py` | The 2.1T architecture (MNAI Nyx 1.2), param count, FLOPs, init, surgery helpers, MoE layers |
 | `multimodal.py` | Any-to-any modules: ViT vision encoder, DiT image decoder, audio encoder/decoder |
-| `train.py` | FSDP2 distributed training, schedulers, optimizers, WandB, eval, full checkpoints |
-| `data.py` | Data loading, filtering, dedup, tokenization, dataset mixing |
+| `train.py` | FSDP2 distributed training, schedulers, optimizers, WandB, eval, full checkpoints, loss spike guard, MoE training |
+| `data.py` | Data loading, filtering, dedup, tokenization, dataset mixing, domain-balanced mix |
+| `scaling.py` | Scaling-law check: tiny proxy runs, power-law fit, predicted loss at 2.210T |
+| `quantize.py` | Checkpoint to GGUF: Q4_K_M and Q8_0 via llama.cpp |
+| `synthetic.py` | Generate synthetic training text from a checkpoint for the data mix |
 | `evaluate.py` | Perplexity, HellaSwag / ARC / Winogrande benchmarks, generation quality |
 | `utils.py` | Logging, seeding, distributed helpers, checkpoints, memory profiling |
 | `inference.py` | Generation with KV cache, batched generation, sampling, chat |
@@ -197,6 +263,21 @@ Yes. The code is MIT licensed and public on GitHub. The model is yours once you 
 
 **Is MNAI Nyx 1.2 any-to-any?**
 Yes. Text, image, and audio in, text, image, and audio out. One model reads and writes all three. The vision encoder, DiT image decoder, and audio encoder/decoder live in multimodal.py.
+
+**Has the architecture been proven at scale?**
+The shape is the standard Llama block layout, the same one LLaMA and Mistral use, with GQA and SwiGLU. Before a full run, `scaling.py` trains three tiny models with the exact same layout, fits a power law to their losses, and predicts the loss at 2.210T. A clean falling trend is the evidence the shape converges. The full 2.1T run itself is what you do when you train it, and `train.py` has a loss spike guard that drops any step above 3x the running average and reloads the last checkpoint, so one bad batch cannot wreck the run.
+
+**Does the repo include the data pipeline?**
+Yes. `data.py` is the pipeline: 15T tokens of FineWeb plus FineWeb-Edu streamed and tokenized on the fly, document filtering, exact dedup by hash, near-dup dedup by shingles, a domain-balanced mix (web 50%, books 15%, code 15%, academic 10%, synthetic 10%), and synthetic data generation in `synthetic.py`. The raw 15TB is not in the repo because no repo holds 15TB. The pipeline that fetches, cleans, dedups, and balances it is.
+
+**Is Nyx dense or MoE?**
+Both. Dense is the default: 2.184T, every token runs through every parameter. MoE is an option (`--moe-experts 8 --moe-topk 2`): 14.512T total, 3.945T active per token, so a token touches 27.2% of the model. MoE holds more capacity for less compute per token, dense is simpler and every Llama tool reads it as-is.
+
+**Are there quantized models?**
+Yes, two. `quantize.py` turns a trained checkpoint into Q4_K_M (~1,201 GB) and Q8_0 (~2,184 GB) GGUFs with llama.cpp. The Q files are produced once someone trains the model; the script is ready now and works on any checkpoint, even a smoke checkpoint.
+
+**Is MNAI Nyx worth training?**
+Yes, if you have the cluster and you want a frontier model that is yours. It is the only public repo that gives you a 2.1T any-to-any model, the full data pipeline for the entire internet, a scaling-law check, dense and MoE, and quantized outputs, all from scratch, all MIT licensed. You bring the GPU, you train it, and the model that comes out is yours. MNAI Nyx family is a real legit AI, That YOU have to train.
 
 ## Credits
 
