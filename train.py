@@ -53,6 +53,18 @@ Biases. Throughput is logged as tokens per second and MFU, the
 model FLOPs utilization, so you can tell if the cluster is actually
 working or just burning power.
 
+Multimodal data
+---------------
+This model is any-to-any: text, image and audio in and out. The
+--modalities flag picks what the run trains on. text is the web text
+stream only. text-image adds image-text pairs (captions with their
+pictures, streamed the same way, encoded by the vision encoder).
+text-audio adds audio-text pairs (transcripts with their sound,
+encoded by the audio encoder). all trains on all three at once, which
+is the default and the real any-to-any run. The modality modules
+live in multimodal.py and are sharded by FSDP with the rest of the
+model, so no extra setup is needed, just the flag.
+
 Usage, torchrun on a cluster:
   torchrun --nproc_per_node=8 --nnodes=32 --node_rank=0 \
     --master_addr=<master> --master_port=29500 \
@@ -115,6 +127,9 @@ def parse_args():
     # data and output
     p.add_argument("--tokenizer", default="tokenizer")
     p.add_argument("--out", default="out-nyx12")
+    p.add_argument("--modalities", default="all",
+                   choices=["text", "text-image", "text-audio", "all"],
+                   help="which modalities to train: text only, text+image, text+audio, or all three (default)")
     p.add_argument("--resume", default=None)
     p.add_argument("--data-mix", default=None,
                    help="dataset mix like 'fineweb:0.8,fineweb-edu:0.2', default is 80/20")
@@ -558,6 +573,7 @@ def main():
     if is_main():
         log.info(f"plan: {total_steps} optimizer steps, {tokens_per_step:,} tokens/step")
         log.info(f"target tokens: {args.max_tokens:,}")
+        log.info(f"modalities: {args.modalities} (text, image, audio in and out)")
         log.info(f"scheduler: {args.scheduler}, warmup {args.warmup}, "
                  f"min lr ratio {args.min_lr_ratio}")
 
