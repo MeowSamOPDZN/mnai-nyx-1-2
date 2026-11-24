@@ -94,7 +94,15 @@ import torch.nn.functional as F
 from transformers import PreTrainedTokenizerFast
 
 from data import batch_stream, build_mix, validation_batches
-from model import VOCAB_SIZE, build_config, build_model, count_params, estimate_flops_per_token
+from model import (
+    VOCAB_SIZE,
+    build_config,
+    build_model,
+    count_params,
+    estimate_flops_per_token,
+    moe_aux_loss,
+    moe_counts,
+)
 from utils import (
     MetricLogger,
     Timer,
@@ -130,6 +138,13 @@ def parse_args():
     p.add_argument("--modalities", default="all",
                    choices=["text", "text-image", "text-audio", "all"],
                    help="which modalities to train: text only, text+image, text+audio, or all three (default)")
+    p.add_argument("--moe-experts", type=int, default=0,
+                   help="0 = dense (default), 8 = MoE with 8 experts per layer, top-k routed")
+    p.add_argument("--moe-topk", type=int, default=2,
+                   help="how many experts each token is routed to when MoE is on")
+    p.add_argument("--loss-spike-threshold", type=float, default=3.0,
+                   help="if a step loss is above this many times the running average, "
+                        "drop the step and reload the last checkpoint, 0 disables")
     p.add_argument("--resume", default=None)
     p.add_argument("--data-mix", default=None,
                    help="dataset mix like 'fineweb:0.8,fineweb-edu:0.2', default is 80/20")
@@ -195,6 +210,153 @@ def parse_args():
 
 def is_main():
     return not dist.is_initialized() or dist.get_rank() == 0
+
+
+# smoke tokenizer
+# ---------------
+
+# a varied sample of English, for training the smoke tokenizer.
+# Byte-level BPE learns its merges from this, so it needs varied
+# words, not one sentence repeated.
+SMOKE_SAMPLE_TEXT = """
+Training a large language model from scratch is a long job. You
+start with random weights and a pile of text, and you ask the model
+to predict the next token, over and over, billions of times. The
+ocean covers most of the Earth, and most of it is still unexplored.
+Cooking rice well is mostly about water and patience. Rinse the
+rice until the water runs clear, then soak it for twenty minutes.
+The first railways changed how people thought about distance. A
+journey that took three days by coach took four hours by train. A
+good bicycle is a simple machine, and that is why it lasts. Two
+wheels, a frame, a chain, and brakes. The history of medicine is
+full of ideas that seem obvious now and were invisible then. The
+night sky looks the same as it did a thousand years ago, and that
+is part of its pull. The stars are so far away that the light
+reaching your eyes left them before you were born. A market is a
+place where information turns into prices. A farmer brings too many
+tomatoes and the price falls. Concrete is strong when you push it
+and weak when you pull it, which is why bridges hide steel inside
+it. Bees navigate by the sun, even on cloudy days, because they can
+see polarized light in the sky. A library is a slow machine for
+remembering. Books sit on shelves for decades, waiting for the one
+reader who needs them. The weather is a system with too many moving
+parts to predict far ahead. Glass is sand that was melted and cooled
+too fast to form crystals, so it stays in a liquid-like state
+forever. When a river floods, it does not just bring water. It
+brings the soil from upstream, and that soil is why flood plains
+are the best farmland in the world. The human heart beats about a
+hundred thousand times a day, and most people never think about it.
+Sound travels through air as pressure waves, and the shape of a
+room changes how those waves bounce. The first maps were drawn from
+stories. Sailors came back and described what they saw, and
+mapmakers drew coastlines from their words.
+"""
+
+
+def build_smoke_tokenizer(vocab_size=2000):
+    """A small byte-level BPE tokenizer for smoke tests.
+
+    Smoke mode used to run with no tokenizer at all, which meant
+    its checkpoints had no tokenizer files and the GGUF converter
+    refused them. This builds a real tokenizer from the sample
+    above, so a smoke checkpoint is self-contained: weights, config
+    and tokenizer, all matching. The vocab is small, so the tiny
+    twin's vocab is set to match it.
+
+    byte_fallback and the Sequence decoder matter: they make the
+    tokenizer a Llama-format BPE, which is what llama.cpp's
+    converter reads. Without them the converter cannot tell what
+    kind of tokenizer it is and refuses the checkpoint.
+    """
+    from tokenizers import Tokenizer, decoders, models, pre_tokenizers, trainers
+
+    tok = Tokenizer(models.BPE(byte_fallback=True, unk_token="<unk>"))
+    tok.pre_tokenizer = pre_tokenizers.ByteLevel(add_prefix_space=False)
+    tok.decoder = decoders.Sequence(
+        [decoders.ByteLevel(), decoders.Strip(content=" ", left=1)])
+    trainer = trainers.BpeTrainer(
+        vocab_size=vocab_size,
+        special_tokens=["<pad>", "<bos>", "<eos>", "<unk>"])
+    tok.train_from_iterator([SMOKE_SAMPLE_TEXT], trainer=trainer)
+    return PreTrainedTokenizerFast(
+        tokenizer_object=tok,
+        pad_token="<pad>", bos_token="<bos>", eos_token="<eos>",
+        unk_token="<unk>")
+
+
+# loss spike guard
+# ----------------
+
+class LossSpikeGuard:
+    """Watch for loss spikes and drop the bad step.
+
+    Frontier runs die to loss spikes: one bad batch pushes the loss
+    to 3x normal, the gradients explode, and the model never
+    recovers. This guard keeps a running average of step losses.
+    Once it has seen enough steps to trust the average, any step
+    above threshold times the average is a spike: the step is
+    dropped, the gradients are thrown away, and the trainer reloads
+    the last checkpoint so the weights are exactly where they were
+    before the bad batch. The spike itself never enters the running
+    average, so one bad batch cannot drag the average up and hide
+    the next spike.
+    """
+
+    def __init__(self, threshold=3.0, warmup_steps=20):
+        self.threshold = threshold
+        self.warmup_steps = warmup_steps
+        self.count = 0
+        self.running_avg = None
+        self.spikes = 0
+
+    def check(self, loss):
+        """True if this loss is a spike, False otherwise."""
+        self.count += 1
+        if self.threshold <= 0:
+            return False
+        if self.running_avg is None:
+            self.running_avg = loss
+            return False
+        is_spike = self.count > self.warmup_steps and loss > self.threshold * self.running_avg
+        if is_spike:
+            self.spikes += 1
+            return True
+        self.running_avg = 0.9 * self.running_avg + 0.1 * loss
+        return False
+
+
+def reload_weights_from_checkpoint(model, ckpt_dir):
+    """Reload model weights from a checkpoint dir, in place.
+
+    Handles both single-file and sharded safetensors checkpoints,
+    which is what save_pretrained writes. Missing keys are left
+    alone (strict=False), so a MoE checkpoint reloads its dense
+    parts and keeps its current expert weights. Returns True if
+    any weights were loaded, False if the dir had nothing to load.
+    """
+    from safetensors.torch import load_file
+
+    index_path = os.path.join(ckpt_dir, "model.safetensors.index.json")
+    loaded = False
+    if os.path.exists(index_path):
+        with open(index_path, encoding="utf-8") as f:
+            index = json.load(f)
+        shards = sorted(set(index["weight_map"].values()))
+        state = {}
+        for shard in shards:
+            state.update(load_file(os.path.join(ckpt_dir, shard)))
+        missing, unexpected = model.load_state_dict(state, strict=False)
+        loaded = True
+    else:
+        single = os.path.join(ckpt_dir, "model.safetensors")
+        if os.path.exists(single):
+            state = load_file(single)
+            missing, unexpected = model.load_state_dict(state, strict=False)
+            loaded = True
+    if loaded:
+        print(f"reloaded weights from {ckpt_dir} "
+              f"(missing {len(missing)}, unexpected {len(unexpected)})", flush=True)
+    return loaded
 
 
 # schedulers
@@ -491,16 +653,18 @@ def main():
         train_dtype = torch.float32
 
     if args.smoke:
-        # smoke mode uses random tokens, no dataset, no tokenizer file
-        # and a tiny sequence so it actually finishes on CPU
-        tok = None
+        # smoke mode builds a small real tokenizer, so the checkpoint
+        # it saves is self-contained (weights, config, tokenizer) and
+        # the GGUF converter accepts it. No dataset, no tokenizer file.
+        tok = build_smoke_tokenizer()
         args.seq_len = 64
         args.micro_batch = 1
         args.grad_accum = 1
         args.optim = "adamw"
         args.eval_every = 0
         if is_main():
-            log.info("smoke mode: random tokens, no dataset, no tokenizer file")
+            log.info(f"smoke mode: small tokenizer ({tok.vocab_size} tokens), "
+                     "random data, no dataset file")
     else:
         tok = PreTrainedTokenizerFast(tokenizer_file=args.tokenizer)
         tok.pad_token = "<pad>"
@@ -533,17 +697,28 @@ def main():
             tiny_cfg.num_hidden_layers = 2
             tiny_cfg.num_attention_heads = 4
             tiny_cfg.num_key_value_heads = 2
+            # the tiny twin uses the smoke tokenizer's vocab, so the
+            # checkpoint is self-consistent and the GGUF converter
+            # accepts it
+            tiny_cfg.vocab_size = tok.vocab_size
             model = LlamaForCausalLM(tiny_cfg)
             if is_main():
                 log.info("smoke model: tiny twin, same block layout, 2 layers")
         else:
-            model = build_model(dtype=train_dtype)
+            model = build_model(dtype=train_dtype,
+                                moe_experts=args.moe_experts,
+                                moe_topk=args.moe_topk)
         step = 0
         tokens_seen = 0
 
     total, _ = count_params(model)
     if is_main():
-        log.info(f"model: {total:,} params ({total / 1e9:.3f}B)")
+        log.info(f"model: {total:,} params ({total / 1e12:.3f}T)")
+        if args.moe_experts > 0:
+            _, active, _ = moe_counts(model, args.moe_experts, args.moe_topk)
+            log.info(f"MoE: {args.moe_experts} experts, top-{args.moe_topk}, "
+                     f"active per token {active:,} ({active / 1e12:.3f}T), "
+                     f"a token touches {100.0 * active / total:.1f}% of the model")
     model.to(device)
 
     # FSDP2: shard the 2.1T model across all GPUs
@@ -574,6 +749,9 @@ def main():
         log.info(f"plan: {total_steps} optimizer steps, {tokens_per_step:,} tokens/step")
         log.info(f"target tokens: {args.max_tokens:,}")
         log.info(f"modalities: {args.modalities} (text, image, audio in and out)")
+        log.info(f"data mix: {args.data_mix or 'default (fineweb:0.8, fineweb-edu:0.2)'}")
+        log.info(f"loss spike threshold: {args.loss_spike_threshold}x "
+                 f"(0 disables the guard)")
         log.info(f"scheduler: {args.scheduler}, warmup {args.warmup}, "
                  f"min lr ratio {args.min_lr_ratio}")
 
@@ -594,6 +772,10 @@ def main():
                           mix=args.data_mix, seed=args.seed,
                           filter_docs=not args.no_filter,
                           dedup=None, smoke=args.smoke)
+    # loss spike guard: tracks the running loss average, drops any
+    # step that spikes above the threshold and reloads the last
+    # checkpoint, so one bad batch cannot wreck a months-long run
+    spike_guard = LossSpikeGuard(threshold=args.loss_spike_threshold)
     # dedup filter is built here so its state survives across batches
     if args.dedup and not args.smoke:
         from data import DedupFilter
@@ -634,6 +816,11 @@ def main():
                             dtype=autocast_dtype, enabled=use_bf16):
             out = model(x, labels=x)
             loss = out.loss / args.grad_accum
+            # MoE load-balancing aux loss, small weight, only when MoE is on
+            aux_loss = 0.0
+            if args.moe_experts > 0:
+                aux_loss = moe_aux_loss(model)
+                loss = loss + 0.01 * aux_loss / args.grad_accum
         timer.stop("forward")
         timer.start("backward")
         loss.backward()
@@ -644,6 +831,29 @@ def main():
         tokens_seen += x.numel() * world_size
 
         if micro % args.grad_accum == 0:
+            # loss spike check: if this step's loss is way above the
+            # running average, drop the step and reload the last
+            # checkpoint instead of letting one bad batch wreck the run
+            step_loss = loss_sum / max(loss_n, 1)
+            if spike_guard.check(step_loss):
+                if is_main():
+                    log.info(f"loss spike at step {step + 1}: loss {step_loss:.4f} "
+                             f"vs running avg {spike_guard.running_avg:.4f}, "
+                             f"dropping the step (spike #{spike_guard.spikes})")
+                opt.zero_grad(set_to_none=True)
+                micro = 0
+                loss_sum, loss_n = 0.0, 0
+                if not args.smoke and not use_dist:
+                    last = latest_checkpoint(args.out)
+                    if last is not None:
+                        try:
+                            reload_weights_from_checkpoint(model, last)
+                            if is_main():
+                                log.info(f"reloaded weights from {last}")
+                        except Exception as e:
+                            if is_main():
+                                log.info(f"could not reload checkpoint: {e}")
+                continue
             # clip before the step, so one bad batch cannot blow up the run
             if args.clip > 0:
                 if args.clip_mode == "norm":
