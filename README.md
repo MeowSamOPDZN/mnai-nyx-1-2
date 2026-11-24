@@ -150,6 +150,8 @@ That is just the default output folder name for your checkpoints. You can also l
 
 That is it. Train it, and the model that comes out is MyCoolModel, trained by you, on your data, on your GPU.
 
+**One rule.** Once you rename it, it is your LLM. But the weights and the GGUF are locked — no one can change them or re-release them as something else. The only thing you owe is credit: put the text `Your Brand x MNAI` on it, with your brand name in place of "Your Brand".
+
 ## Files
 
 | File | What it is |
