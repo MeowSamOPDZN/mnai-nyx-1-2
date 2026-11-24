@@ -311,12 +311,19 @@ def proxy_config(hidden, layers, heads, kv_heads, ffn):
     )
 
 
-# the three proxy runs, small enough for a CPU in minutes
+# the three proxy runs, small enough for a CPU in minutes.
+# One learning rate for all three, 1e-3: a single LR keeps the
+# comparison clean, and 1e-3 is the rate where the loss falls
+# smoothly with size instead of bouncing around. A higher LR makes
+# the small proxy look better than it is and the big proxy worse,
+# which flips the trend.
 PROXIES = [
     {"name": "proxy-1M", "hidden": 128, "layers": 2, "heads": 4, "kv": 2, "ffn": 256},
     {"name": "proxy-5M", "hidden": 256, "layers": 4, "heads": 4, "kv": 2, "ffn": 512},
     {"name": "proxy-20M", "hidden": 512, "layers": 6, "heads": 8, "kv": 2, "ffn": 1024},
 ]
+
+PROXY_LR = 1e-3
 
 
 def count_params(model):
@@ -390,10 +397,10 @@ def run(steps=120, out=None):
                            spec["kv"], spec["ffn"])
         model = LlamaForCausalLM(cfg)
         n = count_params(model)
-        final_loss, _ = train_proxy(cfg, tokens, steps)
+        final_loss, _ = train_proxy(cfg, tokens, steps, lr=PROXY_LR)
         results.append({"name": spec["name"], "params": n,
                         "loss": final_loss})
-        print(f"{spec['name']:12s} {n:>12,} params  loss {final_loss:.4f}")
+        print(f"{spec['name']:12s} {n:>12,} params  loss {final_loss:.4f}  lr {PROXY_LR}")
     print()
     sizes = [r["params"] for r in results]
     losses = [r["loss"] for r in results]
@@ -428,8 +435,8 @@ def run(steps=120, out=None):
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("--steps", type=int, default=120,
-                   help="training steps per proxy, default 120")
+    p.add_argument("--steps", type=int, default=300,
+                   help="training steps per proxy, default 300")
     p.add_argument("--out", default=None,
                    help="write the report as JSON to this file")
     args = p.parse_args()
