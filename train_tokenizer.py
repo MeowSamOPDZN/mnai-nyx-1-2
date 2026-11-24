@@ -63,10 +63,21 @@ def collect_files(patterns):
 
 def train_tokenizer(files, out_dir, vocab_size=VOCAB_SIZE, min_frequency=2,
                     show_progress=True):
-    """Train a byte-level BPE tokenizer on the given files."""
+    """Train a byte-level BPE tokenizer on the given files.
+
+    byte_fallback and the Sequence decoder matter: they make this a
+    Llama-format BPE, which is what llama.cpp's converter reads when
+    it turns a finished checkpoint into a GGUF. Without them the
+    converter cannot tell what kind of tokenizer it is and refuses
+    the checkpoint.
+    """
     print(f"training on {len(files)} files", flush=True)
-    tok = Tokenizer(BPE(unk_token="<unk>"))
+    tok = Tokenizer(BPE(byte_fallback=True, unk_token="<unk>"))
     tok.pre_tokenizer = ByteLevel(add_prefix_space=False)
+    from tokenizers import decoders
+
+    tok.decoder = decoders.Sequence(
+        [decoders.ByteLevel(), decoders.Strip(content=" ", left=1)])
     trainer = BpeTrainer(
         vocab_size=vocab_size,
         special_tokens=SPECIAL,
